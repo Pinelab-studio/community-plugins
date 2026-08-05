@@ -20,6 +20,7 @@ import {
     SimpleGraphQLClient,
     TestServer,
 } from '@vendure/testing';
+import gql from 'graphql-tag';
 import nock from 'nock';
 import fetch from 'node-fetch';
 import path from 'node:path';
@@ -532,6 +533,75 @@ describe('Mollie payments', () => {
         });
     });
 
+    describe('Cancelled orders', () => {
+        it('Logs no error when a cancelled order already has the matching payment', async () => {
+            const transactionId = mollieMockData.molliePaymentResponse.id;
+            const { cancelOrder } = await adminClient.query(cancelOrderDocument, {
+                input: { orderId: order.id },
+            });
+            expect(cancelOrder.state).toBe('Cancelled');
+            expect(cancelOrder.payments).toEqual(
+                expect.arrayContaining([expect.objectContaining({ transactionId })]),
+            );
+            const errorLogSpy = vi.spyOn(Logger, 'error').mockImplementation(() => undefined);
+            onTestFinished(() => errorLogSpy.mockRestore());
+            nock('https://api.mollie.com/')
+                .get(`/v2/payments/${transactionId}`)
+                .reply(200, {
+                    ...mollieMockData.molliePaymentResponse,
+                    description: order.code,
+                    status: OrderStatus.paid,
+                });
+            const response = await fetch(
+                `http://localhost:${serverPort}/payments/mollie/${E2E_DEFAULT_CHANNEL_TOKEN}/1`,
+                {
+                    method: 'post',
+                    body: JSON.stringify({ id: transactionId }),
+                    headers: { 'Content-Type': 'application/json' },
+                },
+            );
+            expect(response.ok).toBe(true);
+            expect(errorLogSpy).not.toHaveBeenCalled();
+        });
+
+        it('Retains the error when an unplaced cancelled order receives an unrecorded payment', async () => {
+            await shopClient.asUserWithCredentials(customers[0].emailAddress, 'test');
+            const { addItemToOrder: unpaidOrder } = await shopClient.query(addItemToOrderDocument, {
+                productVariantId: 'T_1',
+                quantity: 1,
+            });
+            const { cancelOrder } = await adminClient.query(cancelOrderDocument, {
+                input: { orderId: unpaidOrder.id },
+            });
+            expect(cancelOrder.state).toBe('Cancelled');
+            expect(cancelOrder.orderPlacedAt).toBeNull();
+            expect(cancelOrder.payments).toEqual([]);
+            const errorLogSpy = vi.spyOn(Logger, 'error').mockImplementation(() => undefined);
+            onTestFinished(() => errorLogSpy.mockRestore());
+            nock('https://api.mollie.com/')
+                .get('/v2/payments/tr_unrecorded')
+                .reply(200, {
+                    ...mollieMockData.molliePaymentResponse,
+                    id: 'tr_unrecorded',
+                    description: unpaidOrder.code,
+                    status: OrderStatus.paid,
+                });
+            const response = await fetch(
+                `http://localhost:${serverPort}/payments/mollie/${E2E_DEFAULT_CHANNEL_TOKEN}/1`,
+                {
+                    method: 'post',
+                    body: JSON.stringify({ id: 'tr_unrecorded' }),
+                    headers: { 'Content-Type': 'application/json' },
+                },
+            );
+            expect(response.ok).toBe(true);
+            expect(errorLogSpy).toHaveBeenCalledWith(
+                `Order '${unpaidOrder.code}' is 'Cancelled', but was paid for with 'tr_unrecorded'. Payment 'tr_unrecorded' should be refunded.`,
+                'MolliePlugin',
+            );
+        });
+    });
+
     describe('Handle pay-later with manual capture', () => {
         it('Should prepare a new order', async () => {
             await shopClient.asUserWithCredentials(customers[0].emailAddress, 'test');
@@ -722,3 +792,22 @@ describe('Mollie payments', () => {
         });
     });
 });
+
+const cancelOrderDocument = gql`
+    mutation CancelOrder($input: CancelOrderInput!) {
+        cancelOrder(input: $input) {
+            ... on Order {
+                id
+                state
+                orderPlacedAt
+                payments {
+                    transactionId
+                }
+            }
+            ... on ErrorResult {
+                errorCode
+                message
+            }
+        }
+    }
+`;
