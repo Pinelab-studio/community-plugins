@@ -534,7 +534,8 @@ describe('Mollie payments', () => {
     });
 
     describe('Cancelled orders', () => {
-        it('Logs no error when a cancelled order already has the matching payment', async () => {
+        it('Does not log an error when a cancelled order receives a payment notification for an already recorded transactionId', async () => {
+            // Cancel the paid order, then replay the notification for its recorded Mollie transaction.
             const transactionId = mollieMockData.molliePaymentResponse.id;
             const { cancelOrder } = await adminClient.query(cancelOrderDocument, {
                 input: { orderId: order.id },
@@ -564,7 +565,47 @@ describe('Mollie payments', () => {
             expect(errorLogSpy).not.toHaveBeenCalled();
         });
 
+        it('Logs an error when a cancelled order receives payment with a new transaction ID', async () => {
+            // Send a second Mollie payment for the placed, paid, and cancelled order from the test above.
+            const { order: cancelledOrder } = await adminClient.query(getOrderPaymentsDocument, {
+                id: order.id,
+            });
+            expect(cancelledOrder.state).toBe('Cancelled');
+            expect(cancelledOrder.payments).toEqual(
+                expect.arrayContaining([
+                    expect.objectContaining({ transactionId: mollieMockData.molliePaymentResponse.id }),
+                ]),
+            );
+            expect(
+                cancelledOrder.payments.some(payment => payment.transactionId === 'tr_newCancelledPayment'),
+            ).toBe(false);
+            const errorLogSpy = vi.spyOn(Logger, 'error').mockImplementation(() => undefined);
+            onTestFinished(() => errorLogSpy.mockRestore());
+            nock('https://api.mollie.com/')
+                .get('/v2/payments/tr_newCancelledPayment')
+                .reply(200, {
+                    ...mollieMockData.molliePaymentResponse,
+                    id: 'tr_newCancelledPayment',
+                    description: order.code,
+                    status: OrderStatus.paid,
+                });
+            const response = await fetch(
+                `http://localhost:${serverPort}/payments/mollie/${E2E_DEFAULT_CHANNEL_TOKEN}/1`,
+                {
+                    method: 'post',
+                    body: JSON.stringify({ id: 'tr_newCancelledPayment' }),
+                    headers: { 'Content-Type': 'application/json' },
+                },
+            );
+            expect(response.ok).toBe(true);
+            expect(errorLogSpy).toHaveBeenCalledWith(
+                `Order '${order.code}' is already paid. Mollie payment 'tr_newCancelledPayment' should be refunded.`,
+                'MolliePlugin',
+            );
+        });
+
         it('Retains the error when an unplaced cancelled order receives an unrecorded payment', async () => {
+            // Keep coverage for orders cancelled before placement, which bypass the duplicate-payment check.
             await shopClient.asUserWithCredentials(customers[0].emailAddress, 'test');
             const { addItemToOrder: unpaidOrder } = await shopClient.query(addItemToOrderDocument, {
                 productVariantId: 'T_1',
